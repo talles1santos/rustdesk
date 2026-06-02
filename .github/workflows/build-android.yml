@@ -1,0 +1,161 @@
+name: Build Android — Suporte Remoto Ti4Works
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  APP_NAME: "Suporte Remoto Ti4Works"
+  DEFAULT_RENDEZVOUS_SERVER: "rustdesk.ti4works.com.br"
+  DEFAULT_RS_PUB_KEY: "JSoPnMHqpwmruCKMHBJoxwCY6gx8Fu1AeequQLyW5fA="
+  DEFAULT_RELAY_SERVER: "rustdesk.ti4works.com.br"
+
+jobs:
+  build-android:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout (com submódulos)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # ── Sistema ───────────────────────────────────────────────────────────
+      - name: Instalar dependências do sistema
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            curl \
+            git \
+            libclang-dev \
+            nasm \
+            yasm \
+            python3 \
+            unzip \
+            zip
+
+      # ── Java ──────────────────────────────────────────────────────────────
+      - name: Instalar Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # ── Android SDK / NDK ─────────────────────────────────────────────────
+      - name: Configurar Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Instalar NDK e CMake
+        run: |
+          sdkmanager --install "ndk;25.2.9519653" "cmake;3.22.1"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/25.2.9519653" >> $GITHUB_ENV
+
+      # ── Rust (targets Android) ────────────────────────────────────────────
+      - name: Instalar Rust stable + targets Android
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: |
+            aarch64-linux-android
+            armv7-linux-androideabi
+            x86_64-linux-android
+
+      - name: Instalar cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: android-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: android-cargo-
+
+      # ── Flutter ───────────────────────────────────────────────────────────
+      - name: Instalar Flutter stable
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Flutter pub get
+        run: cd flutter && flutter pub get
+
+      # ── Patch ─────────────────────────────────────────────────────────────
+      - name: Aplicar patch de configuração
+        run: |
+          sed -i \
+            's|rs-ny.rustdesk.com|${{ env.DEFAULT_RENDEZVOUS_SERVER }}|g' \
+            libs/hbb_common/src/config.rs
+          sed -i \
+            's|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${{ env.DEFAULT_RS_PUB_KEY }}|g' \
+            libs/hbb_common/src/config.rs
+          sed -i \
+            's|"RustDesk"|"${{ env.APP_NAME }}"|g' \
+            libs/hbb_common/src/config.rs
+
+          # Atualizar nome do app no AndroidManifest e strings Android
+          if [ -f flutter/android/app/src/main/AndroidManifest.xml ]; then
+            sed -i 's|android:label="[^"]*"|android:label="${{ env.APP_NAME }}"|g' \
+              flutter/android/app/src/main/AndroidManifest.xml
+          fi
+          if [ -f flutter/android/app/src/main/res/values/strings.xml ]; then
+            sed -i 's|<string name="app_name">[^<]*</string>|<string name="app_name">${{ env.APP_NAME }}</string>|g' \
+              flutter/android/app/src/main/res/values/strings.xml
+          fi
+
+          echo "✅ Patch Android aplicado"
+
+      # ── Build libs nativas para Android ──────────────────────────────────
+      - name: Build libs Rust para Android (arm64)
+        run: |
+          cargo ndk \
+            -t arm64-v8a \
+            -o flutter/android/app/src/main/jniLibs \
+            build --release
+
+      # ── Build APK ─────────────────────────────────────────────────────────
+      - name: Build APK Release
+        run: |
+          cd flutter
+          flutter build apk --release --target-platform android-arm64
+          ls -lh build/app/outputs/flutter-apk/
+
+      - name: Renomear APK
+        run: |
+          cp flutter/build/app/outputs/flutter-apk/app-release.apk \
+             SuporteRemotoTi4Works-android-arm64.apk
+          echo "✅ APK: SuporteRemotoTi4Works-android-arm64.apk"
+
+      - name: Upload artefato Android
+        uses: actions/upload-artifact@v4
+        with:
+          name: SuporteRemotoTi4Works-android
+          path: SuporteRemotoTi4Works-android-arm64.apk
+          retention-days: 30
+
+  release-android:
+    needs: build-android
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: SuporteRemotoTi4Works-android
+
+      - name: Criar GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SuporteRemotoTi4Works-android-arm64.apk
+          name: "Suporte Remoto Ti4Works ${{ github.ref_name }}"
+          body: |
+            ## Suporte Remoto Ti4Works — ${{ github.ref_name }}
+            Servidor: rustdesk.ti4works.com.br
+            Plataforma: Android ARM64

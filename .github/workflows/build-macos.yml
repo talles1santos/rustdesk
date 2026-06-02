@@ -1,0 +1,155 @@
+name: Build macOS — Suporte Remoto Ti4Works
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  APP_NAME: "Suporte Remoto Ti4Works"
+  DEFAULT_RENDEZVOUS_SERVER: "rustdesk.ti4works.com.br"
+  DEFAULT_RS_PUB_KEY: "JSoPnMHqpwmruCKMHBJoxwCY6gx8Fu1AeequQLyW5fA="
+  DEFAULT_RELAY_SERVER: "rustdesk.ti4works.com.br"
+
+jobs:
+  build-macos:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-13        # Intel x86_64
+            target: x86_64-apple-darwin
+            arch: x64
+          - runner: macos-14        # Apple Silicon arm64
+            target: aarch64-apple-darwin
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout (com submódulos)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # ── Homebrew deps ─────────────────────────────────────────────────────
+      - name: Instalar dependências via Homebrew
+        run: |
+          brew update
+          brew install \
+            cmake \
+            nasm \
+            yasm \
+            libvpx \
+            opus \
+            libyuv \
+            pkg-config
+
+      # ── Rust ──────────────────────────────────────────────────────────────
+      - name: Instalar Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: macos-${{ matrix.arch }}-cargo-
+
+      # ── Flutter ───────────────────────────────────────────────────────────
+      - name: Instalar Flutter stable
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Habilitar Flutter Desktop (macOS)
+        run: |
+          flutter config --enable-macos-desktop
+          flutter --version
+          flutter doctor -v
+
+      - name: Flutter pub get
+        run: cd flutter && flutter pub get
+
+      # ── Patch ─────────────────────────────────────────────────────────────
+      - name: Aplicar patch de configuração
+        run: |
+          # macOS sed requer '' para backup inline (BSD sed)
+          sed -i '' \
+            's|rs-ny.rustdesk.com|${{ env.DEFAULT_RENDEZVOUS_SERVER }}|g' \
+            libs/hbb_common/src/config.rs
+          sed -i '' \
+            's|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${{ env.DEFAULT_RS_PUB_KEY }}|g' \
+            libs/hbb_common/src/config.rs
+          sed -i '' \
+            's|"RustDesk"|"${{ env.APP_NAME }}"|g' \
+            libs/hbb_common/src/config.rs
+
+          # Atualizar nome no Info.plist do bundle macOS
+          if [ -f flutter/macos/Runner/Info.plist ]; then
+            /usr/libexec/PlistBuddy -c \
+              "Set :CFBundleName '${{ env.APP_NAME }}'" \
+              flutter/macos/Runner/Info.plist || true
+            /usr/libexec/PlistBuddy -c \
+              "Set :CFBundleDisplayName '${{ env.APP_NAME }}'" \
+              flutter/macos/Runner/Info.plist || true
+          fi
+
+          echo "✅ Patch macOS aplicado"
+          grep -n "ti4works\|Ti4Works" libs/hbb_common/src/config.rs | head -5
+
+      # ── Build ─────────────────────────────────────────────────────────────
+      - name: Build Release (macOS ${{ matrix.arch }})
+        run: python3 build.py --flutter
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "10.14"
+
+      # ── Empacotar .dmg ────────────────────────────────────────────────────
+      - name: Empacotar .app em .dmg
+        run: |
+          APP=$(find flutter/build/macos -name "*.app" | head -1)
+          if [ -n "$APP" ]; then
+            DMG_NAME="SuporteRemotoTi4Works-macos-${{ matrix.arch }}.dmg"
+            hdiutil create \
+              -volname "Suporte Remoto Ti4Works" \
+              -srcfolder "$APP" \
+              -ov -format UDZO \
+              "$DMG_NAME"
+            echo "✅ DMG: $DMG_NAME"
+          else
+            echo "⚠️  .app não encontrado, listando build:"
+            find flutter/build/macos -type f | head -20
+          fi
+
+      - name: Upload artefato macOS ${{ matrix.arch }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: SuporteRemotoTi4Works-macos-${{ matrix.arch }}
+          path: SuporteRemotoTi4Works-macos-${{ matrix.arch }}.dmg
+          retention-days: 30
+
+  release-macos:
+    needs: build-macos
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: SuporteRemotoTi4Works-macos-*
+          merge-multiple: true
+
+      - name: Criar GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SuporteRemotoTi4Works-macos-*.dmg
+          name: "Suporte Remoto Ti4Works ${{ github.ref_name }}"
+          body: |
+            ## Suporte Remoto Ti4Works — ${{ github.ref_name }}
+            Servidor: rustdesk.ti4works.com.br
+            Plataformas: macOS Intel (x64) e Apple Silicon (arm64)

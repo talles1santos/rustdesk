@@ -1,0 +1,150 @@
+name: Build Linux x64 — Suporte Remoto Ti4Works
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  APP_NAME: "Suporte Remoto Ti4Works"
+  DEFAULT_RENDEZVOUS_SERVER: "rustdesk.ti4works.com.br"
+  DEFAULT_RS_PUB_KEY: "JSoPnMHqpwmruCKMHBJoxwCY6gx8Fu1AeequQLyW5fA="
+  DEFAULT_RELAY_SERVER: "rustdesk.ti4works.com.br"
+
+jobs:
+  build-linux-x64:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout (com submódulos)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # ── Sistema ───────────────────────────────────────────────────────────
+      - name: Instalar dependências do sistema
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            curl \
+            git \
+            libclang-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libgtk-3-dev \
+            libasound2-dev \
+            libpulse-dev \
+            libdbus-1-dev \
+            libxcb-randr0-dev \
+            libxdo-dev \
+            libxfixes-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libyuv-dev \
+            libvpx-dev \
+            libopus-dev \
+            nasm \
+            yasm \
+            zip \
+            python3
+
+      # ── Rust ──────────────────────────────────────────────────────────────
+      - name: Instalar Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-cargo-
+
+      # ── Flutter ───────────────────────────────────────────────────────────
+      - name: Instalar Flutter stable
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Habilitar Flutter Desktop (Linux)
+        run: |
+          flutter config --enable-linux-desktop
+          flutter --version
+          flutter doctor -v
+
+      # ── Patch ─────────────────────────────────────────────────────────────
+      - name: Aplicar patch de configuração
+        run: |
+          sed -i \
+            's|rs-ny.rustdesk.com|${{ env.DEFAULT_RENDEZVOUS_SERVER }}|g' \
+            libs/hbb_common/src/config.rs
+          sed -i \
+            's|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${{ env.DEFAULT_RS_PUB_KEY }}|g' \
+            libs/hbb_common/src/config.rs
+          sed -i \
+            's|"RustDesk"|"${{ env.APP_NAME }}"|g' \
+            libs/hbb_common/src/config.rs
+
+          echo "✅ Patch aplicado:"
+          grep -n "ti4works\|Ti4Works\|APP_NAME" libs/hbb_common/src/config.rs | head -10
+
+      # ── Flutter pub get ───────────────────────────────────────────────────
+      - name: Flutter pub get
+        run: cd flutter && flutter pub get
+
+      # ── Build ─────────────────────────────────────────────────────────────
+      - name: Build Release (Linux)
+        run: python3 build.py --flutter
+
+      # ── Empacotar ─────────────────────────────────────────────────────────
+      - name: Empacotar .deb / binário
+        run: |
+          DEB=$(find . -name "*.deb" | head -1)
+          if [ -n "$DEB" ]; then
+            cp "$DEB" SuporteRemotoTi4Works-linux-x64.deb
+            echo "✅ Pacote: SuporteRemotoTi4Works-linux-x64.deb"
+          else
+            BIN=$(find flutter/build/linux -name "rustdesk" -type f | head -1)
+            if [ -n "$BIN" ]; then
+              cp "$BIN" SuporteRemotoTi4Works-linux-x64
+              chmod +x SuporteRemotoTi4Works-linux-x64
+              echo "✅ Binário: SuporteRemotoTi4Works-linux-x64"
+            fi
+          fi
+
+      - name: Upload artefato Linux
+        uses: actions/upload-artifact@v4
+        with:
+          name: SuporteRemotoTi4Works-linux-x64
+          path: |
+            SuporteRemotoTi4Works-linux-x64*
+          retention-days: 30
+
+  release-linux:
+    needs: build-linux-x64
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: SuporteRemotoTi4Works-linux-x64
+
+      - name: Criar GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SuporteRemotoTi4Works-linux-x64*
+          name: "Suporte Remoto Ti4Works ${{ github.ref_name }}"
+          body: |
+            ## Suporte Remoto Ti4Works — ${{ github.ref_name }}
+            Servidor: rustdesk.ti4works.com.br
+            Plataforma: Linux x64
