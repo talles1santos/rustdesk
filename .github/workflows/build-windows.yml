@@ -55,10 +55,19 @@ jobs:
           flutter doctor -v
 
       # ── Dependências nativas ─────────────────────────────────────────────
-      - name: Instalar LLVM/Clang 15
+      - name: Configurar LLVM/Clang (ja instalado no runner)
         run: |
-          choco install -y llvm --version=15.0.2
-          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+          # O runner windows-2022 ja inclui LLVM 20 - apenas apontamos o path correto
+          $clangExe = Get-Command clang -ErrorAction SilentlyContinue
+          if ($clangExe) {
+            $llvmBin = Split-Path $clangExe.Source
+            echo "LIBCLANG_PATH=$llvmBin" >> $env:GITHUB_ENV
+            Write-Host "LLVM encontrado: $llvmBin"
+            clang --version
+          } else {
+            choco upgrade -y llvm
+            echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+          }
 
       - name: Instalar vcpkg e libs nativas
         run: |
