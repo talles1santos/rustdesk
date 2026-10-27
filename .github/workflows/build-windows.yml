@@ -1,8 +1,12 @@
 name: Build Windows x64 — Suporte Remoto Ti4Works
 
+# Baseado no job "build-for-windows-flutter" do flutter-build.yml oficial
+# (mesmas versões de Flutter, Rust, LLVM e vcpkg), só para Windows x64,
+# sem assinatura nem MSI, com servidor e chave da Ti4Works embutidos.
+
 on:
   push:
-    branches: [main, master]
+    branches: [master]
     tags: ['v*']
   workflow_dispatch:
 
@@ -10,143 +14,171 @@ env:
   APP_NAME: "Suporte Remoto Ti4Works"
   DEFAULT_RENDEZVOUS_SERVER: "rustdesk.ti4works.com.br"
   DEFAULT_RS_PUB_KEY: "JSoPnMHqpwmruCKMHBJoxwCY6gx8Fu1AeequQLyW5fA="
-  DEFAULT_RELAY_SERVER: "rustdesk.ti4works.com.br"
-  CARGO_INCREMENTAL: "0"
+  OUTPUT_NAME: "SuporteRemotoTi4Works-windows-x64"
+  # Valores copiados do flutter-build.yml oficial — atualizar junto quando ele mudar
+  SCITER_RUST_VERSION: "1.75"
+  LLVM_VERSION: "15.0.6"
+  FLUTTER_VERSION: "3.24.5"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
 
 jobs:
-  build-windows-x64:
-    runs-on: windows-2022
-    defaults:
-      run:
-        shell: pwsh
+  generate-bridge:
+    uses: ./.github/workflows/bridge.yml
 
+  build-topmost-window:
+    uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
+    with:
+      upload-artifact: true
+      target: windows-2022
+      configuration: Release
+      platform: x64
+      target_version: Windows10
+
+  build-windows-x64:
+    needs: [generate-bridge, build-topmost-window]
+    runs-on: windows-2022
     steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
       - name: Checkout (com submódulos)
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           submodules: recursive
 
-      # ── Rust ────────────────────────────────────────────────────────────
-      - name: Instalar Rust stable (MSVC)
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-
-      - name: Cache Cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: windows-cargo-
-
-      # ── Flutter ─────────────────────────────────────────────────────────
-      - name: Instalar Flutter stable
-        uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-
-      - name: Habilitar Flutter Desktop (Windows)
+      # ── Patch: servidor, chave e nome ──────────────────────────────────
+      # Substituição literal (.Replace), não regex: a chave padrão tem "+",
+      # que no -replace do PowerShell vira quantificador e a troca falha calada.
+      - name: Aplicar patch de configuração Ti4Works
+        shell: pwsh
         run: |
-          flutter config --enable-windows-desktop
-          flutter --version
+          $f = "libs/hbb_common/src/config.rs"
+          $c = [IO.File]::ReadAllText($f)
+          $pairs = @(
+            @('&["rs-ny.rustdesk.com"]', '&["${{ env.DEFAULT_RENDEZVOUS_SERVER }}"]'),
+            @('"OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw="', '"${{ env.DEFAULT_RS_PUB_KEY }}"'),
+            @('RwLock::new("RustDesk".to_owned())', 'RwLock::new("${{ env.APP_NAME }}".to_owned())')
+          )
+          foreach ($p in $pairs) {
+            if (-not $c.Contains($p[0])) { Write-Error "Trecho não encontrado em config.rs: $($p[0])"; exit 1 }
+            $c = $c.Replace($p[0], $p[1])
+          }
+          [IO.File]::WriteAllText($f, $c, (New-Object Text.UTF8Encoding $false))
+          Select-String -Path $f -Pattern 'RENDEZVOUS_SERVERS: |RS_PUB_KEY: |APP_NAME: '
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2.0.9
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Install flutter
+        uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225 # v2.12.0
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          architecture: x64
+
+      - name: Replace engine with rustdesk custom flutter engine
+        run: |
           flutter doctor -v
+          flutter precache --windows
+          Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
+          Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release
+          mv -Force windows-x64-release/*  C:/hostedtoolcache/windows/flutter/stable-${{ env.FLUTTER_VERSION }}-x64/bin/cache/artifacts/engine/windows-x64-release/
 
-      # ── Dependências nativas ─────────────────────────────────────────────
-      - name: Configurar LLVM/Clang (ja instalado no runner)
+      - name: Patch flutter
+        shell: bash
         run: |
-          # O runner windows-2022 ja inclui LLVM 20 - apenas apontamos o path correto
-          $clangExe = Get-Command clang -ErrorAction SilentlyContinue
-          if ($clangExe) {
-            $llvmBin = Split-Path $clangExe.Source
-            echo "LIBCLANG_PATH=$llvmBin" >> $env:GITHUB_ENV
-            Write-Host "LLVM encontrado: $llvmBin"
-            clang --version
-          } else {
-            choco upgrade -y llvm
-            echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
-          }
+          cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff $(dirname $(dirname $(which flutter)))
+          cd $(dirname $(dirname $(which flutter)))
+          git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
 
-      - name: Instalar vcpkg e libs nativas
-        run: |
-          git clone https://github.com/microsoft/vcpkg "$env:USERPROFILE\vcpkg"
-          & "$env:USERPROFILE\vcpkg\bootstrap-vcpkg.bat"
-          echo "VCPKG_ROOT=$env:USERPROFILE\vcpkg" >> $env:GITHUB_ENV
-          & "$env:USERPROFILE\vcpkg\vcpkg" install `
-            libvpx:x64-windows-static `
-            libyuv:x64-windows-static `
-            opus:x64-windows-static `
-            aom:x64-windows-static
-
-      # ── Patch: servidor, chave e nome ────────────────────────────────────
-      - name: Aplicar patch de configuração
-        run: |
-          # Servidor e chave pública
-          (Get-Content libs/hbb_common/src/config.rs) `
-            -replace 'rs-ny.rustdesk.com', '${{ env.DEFAULT_RENDEZVOUS_SERVER }}' `
-            -replace 'OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=', '${{ env.DEFAULT_RS_PUB_KEY }}' |
-            Set-Content libs/hbb_common/src/config.rs
-
-          # Nome do app
-          (Get-Content libs/hbb_common/src/config.rs) `
-            -replace '"RustDesk"', '"${{ env.APP_NAME }}"' |
-            Set-Content libs/hbb_common/src/config.rs
-
-          Write-Host "✅ Patch aplicado em config.rs"
-          Select-String -Path libs/hbb_common/src/config.rs -Pattern "ti4works|Ti4Works|APP_NAME" | Select-Object -First 10
-
-      # ── Flutter pub get ───────────────────────────────────────────────────
-      - name: Flutter pub get
-        run: |
-          cd flutter
-          flutter pub get
-
-      # ── Build ─────────────────────────────────────────────────────────────
-      - name: Build Release (Windows)
-        run: |
-          python3 .\build.py --flutter
-        env:
-          VCPKG_ROOT: ${{ env.VCPKG_ROOT }}
-
-      # ── Empacotar .exe instalador ─────────────────────────────────────────
-      - name: Renomear executável
-        run: |
-          $src = "flutter\build\windows\x64\runner\Release\rustdesk.exe"
-          $dst = "SuporteRemotoTi4Works-windows-x64.exe"
-          if (Test-Path $src) {
-            Copy-Item $src $dst
-            Write-Host "✅ Executável: $dst"
-          } else {
-            Get-ChildItem -Recurse -Filter "*.exe" | Where-Object { $_.Name -like "*rustdesk*" }
-          }
-
-      - name: Upload artefato Windows
-        uses: actions/upload-artifact@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          name: SuporteRemotoTi4Works-windows-x64
-          path: SuporteRemotoTi4Works-windows-x64.exe
+          toolchain: ${{ env.SCITER_RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: windows-2022
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
+        shell: bash
+        run: |
+          if ! $VCPKG_ROOT/vcpkg install --triplet x64-windows-static --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+              echo "$_1:"; echo "======"; cat "$_1"; echo "======"; echo ""
+            done
+            exit 1
+          fi
+
+      - name: Build rustdesk
+        run: |
+          python3 .\build.py --portable --flutter --skip-portable-pack --hwcodec --vram
+          mv ./flutter/build/windows/x64/runner/Release ./rustdesk
+
+          Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
+          Expand-Archive usbmmidd_v2.zip -DestinationPath .
+          Remove-Item -Path usbmmidd_v2\Win32 -Recurse
+          Remove-Item -Path "usbmmidd_v2\deviceinstaller64.exe", "usbmmidd_v2\deviceinstaller.exe", "usbmmidd_v2\usbmmidd.bat"
+          mv -Force .\usbmmidd_v2 ./rustdesk
+
+      - name: find Runner.res
+        continue-on-error: true
+        shell: bash
+        run: |
+          runner_res=$(find . -name "Runner.res")
+          if [ -n "$runner_res" ]; then cp $runner_res ./libs/portable/Runner.res; fi
+
+      - name: Download RustDeskTempTopMostWindow artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: topmostwindow-artifacts-x64
+          path: "./rustdesk"
+
+      - name: Build self-extracted executable
+        shell: bash
+        run: |
+          sed -i '/dpiAware/d' res/manifest.xml
+          pushd ./libs/portable
+          pip3 install -r requirements.txt
+          python3 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/rustdesk.exe
+          popd
+          mkdir -p ./out
+          mv ./target/release/rustdesk-portable-packer.exe "./out/${OUTPUT_NAME}.exe"
+          ls -l ./out
+
+      - name: Upload executável
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.OUTPUT_NAME }}
+          path: ./out/${{ env.OUTPUT_NAME }}.exe
           retention-days: 30
 
-  # ── Release automático ao criar tag ────────────────────────────────────────
-  release-windows:
-    needs: build-windows-x64
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v4
+      - name: Publicar release (só em tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         with:
-          name: SuporteRemotoTi4Works-windows-x64
-
-      - name: Criar GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: SuporteRemotoTi4Works-windows-x64.exe
-          name: "Suporte Remoto Ti4Works ${{ github.ref_name }}"
-          body: |
-            ## Suporte Remoto Ti4Works — ${{ github.ref_name }}
-            Servidor: rustdesk.ti4works.com.br
-            Plataforma: Windows x64
+          files: ./out/${{ env.OUTPUT_NAME }}.exe
